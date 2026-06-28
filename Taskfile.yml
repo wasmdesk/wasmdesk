@@ -1,0 +1,67 @@
+# Taskfile for the wasmdesk meta-project -- https://taskfile.dev
+#
+#   task up        # build everything, push Quake assets if possible, start the 3 servers
+#   task down      # stop the 3 servers + the registry container
+#   task build     # build the orchestrator + delegate to sibling repos
+#   task status    # GET /healthz on each endpoint
+#   task logs      # tail the supervisor log file
+#
+# The actual work lives in cmd/up (a Go orchestrator). This Taskfile is the
+# friendly entry point and a thin wrapper over `go run`.
+version: "3"
+
+env:
+  CGO_ENABLED: "0"
+  GOWORK: "off"
+
+vars:
+  WASMBOX_PORT: '{{default "8080" .WASMBOX_PORT}}'
+  WASMAQUA_PORT: '{{default "8081" .WASMAQUA_PORT}}'
+  WASMLOGIN_PORT: '{{default "9000" .WASMLOGIN_PORT}}'
+  REGISTRY_PORT: '{{default "5000" .REGISTRY_PORT}}'
+
+tasks:
+  default:
+    desc: List the available tasks
+    silent: true
+    cmds:
+      - task -l
+
+  build:
+    desc: Build the cmd/up orchestrator
+    cmds:
+      - mkdir -p bin
+      - go build -trimpath -o bin/wasmdesk-up ./cmd/up
+
+  up:
+    desc: Build everything + start the full wasmdesk stack
+    deps: [build]
+    cmds:
+      - ./bin/wasmdesk-up
+
+  down:
+    desc: Stop the wasmdesk stack -- SIGTERM the 3 servers + stop the OCI registry container
+    cmds:
+      - ./bin/wasmdesk-up -mode=down || go run ./cmd/up -mode=down
+
+  status:
+    desc: Probe /healthz on the 4 endpoints (registry + 3 servers)
+    cmds:
+      - ./bin/wasmdesk-up -mode=status || go run ./cmd/up -mode=status
+
+  logs:
+    desc: Tail the supervisor log file (~/.wasmdesk/up.log)
+    cmds:
+      - touch "$HOME/.wasmdesk/up.log" 2>/dev/null || true
+      - tail -F "$HOME/.wasmdesk/up.log"
+
+  test:
+    desc: Run go test with coverage (100% floor on cmd/up)
+    cmds:
+      - go test -race -coverprofile=coverage.out ./...
+      - go tool cover -func=coverage.out | tail -1
+
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - rm -rf bin coverage.out
