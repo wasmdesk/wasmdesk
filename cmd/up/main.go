@@ -3,15 +3,21 @@
 
 // Command up is the wasmdesk meta-project orchestrator.
 //
-// It runs the stack bring-up in five strictly ordered phases:
+// It runs the stack bring-up in six strictly ordered phases:
 //
 //  1. registry  -- probe :5000, reuse if a registry is already serving /v2/,
 //     otherwise `docker run registry:2` with CORS+CORP headers wide open.
-//  2. build     -- delegate to each sibling repo's own `task build` target.
-//  3. quake     -- best-effort `task -d $ENGINE_DIR oci-pack && oci-push`.
-//  4. spawn     -- launch wasmbox-serve / wasmaqua-serve / wasmlogin and tail
+//  2. refresh   -- (a) before build: delete sibling wasm artifacts so Taskfile
+//     `generates:` rules see them as missing and rebuild from the latest
+//     cross-repo sources; (b) after build: re-pack + re-push the OCI images
+//     (terminal/files/hello/dock/code + Quake assets) so the bytes served from
+//     the registry match the freshly built wasms. Gate with SKIP_REFRESH=1
+//     when iterating fast and you trust the on-disk state.
+//  3. build     -- delegate to each sibling repo's own `task build` target.
+//  4. quake     -- best-effort `task -d $ENGINE_DIR oci-pack && oci-push`.
+//  5. spawn     -- launch wasmbox-serve / wasmaqua-serve / wasmlogin and tail
 //     their stdout/stderr with coloured "[name] " prefixes.
-//  5. health    -- poll /healthz (or /) on each endpoint every 200 ms until all
+//  6. health    -- poll /healthz (or /) on each endpoint every 200 ms until all
 //     respond 200 or 10 s elapses; print the "stack up" banner on success.
 //
 // On SIGINT/SIGTERM the supervisor's StopAll runs: every child gets SIGTERM,
@@ -51,6 +57,10 @@ type Config struct {
 	SkipBuild     bool
 	SkipRegistry  bool
 	SkipQuakePush bool
+	// SkipRefresh disables the cross-repo wasm/OCI refresh phase. Default is
+	// false (refresh runs) so every `task up` picks up sibling-repo source
+	// changes. Set to true for fast iteration via `task up:fast`.
+	SkipRefresh bool
 
 	// HealthTimeout caps how long Phase 5 waits before declaring failure.
 	HealthTimeout time.Duration
@@ -87,7 +97,8 @@ func LoadConfig(args []string, getenv func(string) string, stdout, stderr io.Wri
 	skipBuild := fs.Bool("skip-build", envOrBool(getenv, "SKIP_BUILD", false), "skip the build phase")
 	skipRegistry := fs.Bool("skip-registry", envOrBool(getenv, "SKIP_REGISTRY", false), "skip the registry phase")
 	skipQuakePush := fs.Bool("skip-quake-push", envOrBool(getenv, "SKIP_QUAKE_PUSH", false), "skip the Quake OCI push phase")
-	mode := fs.String("mode", "up", "operation mode: up | down | status")
+	skipRefresh := fs.Bool("skip-refresh", envOrBool(getenv, "SKIP_REFRESH", false), "skip the cross-repo wasm/OCI refresh phase")
+	mode := fs.String("mode", "up", "operation mode: up | down | status | refresh")
 
 	healthTimeout := fs.Duration("health-timeout", envOrDuration(getenv, "HEALTH_TIMEOUT", 10*time.Second), "health-poll timeout")
 	stopGrace := fs.Duration("stop-grace", envOrDuration(getenv, "STOP_GRACE", 3*time.Second), "SIGTERM grace period")
@@ -103,6 +114,7 @@ func LoadConfig(args []string, getenv func(string) string, stdout, stderr io.Wri
 		SkipBuild:     *skipBuild,
 		SkipRegistry:  *skipRegistry,
 		SkipQuakePush: *skipQuakePush,
+		SkipRefresh:   *skipRefresh,
 		HealthTimeout: *healthTimeout,
 		StopGrace:     *stopGrace,
 		Stdout:        stdout,
@@ -129,8 +141,10 @@ func Run(ctx context.Context, cfg Config, r Runner, signalCh <-chan os.Signal) e
 		return runDown(ctx, cfg, r)
 	case "status":
 		return runStatus(ctx, cfg)
+	case "refresh":
+		return runRefresh(ctx, cfg, r)
 	default:
-		return fmt.Errorf("unknown mode %q (want up|down|status)", cfg.Mode)
+		return fmt.Errorf("unknown mode %q (want up|down|status|refresh)", cfg.Mode)
 	}
 }
 
@@ -148,7 +162,17 @@ func runUp(ctx context.Context, cfg Config, r Runner, signalCh <-chan os.Signal)
 		logf(cfg.Stdout, "[skip] registry phase (SKIP_REGISTRY=1)")
 	}
 
-	// Phase 2 -- build.
+	// Phase 2a -- refresh (clean stale wasm artifacts so the upcoming build
+	// phase rebuilds from the latest sibling-repo sources).
+	if !cfg.SkipRefresh {
+		if err := PhaseRefreshClean(ctx, cfg); err != nil {
+			return fmt.Errorf("refresh-clean phase: %w", err)
+		}
+	} else {
+		logf(cfg.Stdout, "[skip] refresh phase (SKIP_REFRESH=1)")
+	}
+
+	// Phase 3 -- build.
 	if !cfg.SkipBuild {
 		if err := PhaseBuild(ctx, cfg, r); err != nil {
 			return fmt.Errorf("build phase: %w", err)
@@ -157,7 +181,17 @@ func runUp(ctx context.Context, cfg Config, r Runner, signalCh <-chan os.Signal)
 		logf(cfg.Stdout, "[skip] build phase (SKIP_BUILD=1)")
 	}
 
-	// Phase 3 -- Quake OCI push (best-effort).
+	// Phase 2b -- refresh (re-pack + re-push OCI images now that the wasms
+	// reflect the new sources; best-effort because it depends on a live
+	// registry, but a registry failure here means the browser would serve
+	// stale bytes, so we surface it).
+	if !cfg.SkipRefresh {
+		if err := PhaseRefreshRepack(ctx, cfg, r); err != nil {
+			logf(cfg.Stderr, "refresh-repack phase (best-effort): %v", err)
+		}
+	}
+
+	// Phase 4 -- Quake OCI push (best-effort).
 	if !cfg.SkipQuakePush {
 		if err := PhaseQuakePush(ctx, cfg, r); err != nil {
 			logf(cfg.Stderr, "quake push phase (best-effort): %v", err)
@@ -288,6 +322,117 @@ func PhaseBuild(ctx context.Context, cfg Config, r Runner) error {
 			return fmt.Errorf("%s build: %w", j.name, err)
 		}
 	}
+	return nil
+}
+
+// refreshClients is the canonical list of wasmbox sibling-client apps that
+// PhaseRefresh wipes + repacks + repushes. Keep in sync with the
+// `ociapps:pack:<app>` / `ociapps:push:<app>` targets in wasmbox/Taskfile.yml
+// (quake is handled separately by PhaseQuakePush).
+var refreshClients = []string{"terminal", "files", "hello", "dock", "code"}
+
+// refreshArtifactPaths returns the absolute paths of the wasm artifacts that
+// PhaseRefreshClean removes. Split out (a) so tests can assert the path set
+// without re-implementing it, (b) so we have one place to maintain when
+// sibling repos grow new clients.
+//
+// For each entry the corresponding source repo + Taskfile target is:
+//   wasmbox/clients/{app}/{app}.wasm      -> wasmbox    `task build:{app}`
+//   wasmbox/wasmbox.wasm                  -> wasmbox    `task build:compositor`
+//   wasmbox/clients/quake/quake.wasm      -> wasmbox    `task build:quake`
+//   wasmaqua/wasmaqua.wasm                -> wasmaqua   `task build:compositor`
+func refreshArtifactPaths(cfg Config) []string {
+	paths := []string{
+		filepath.Join(cfg.WasmboxDir, "wasmbox.wasm"),
+		filepath.Join(cfg.WasmboxDir, "clients", "quake", "quake.wasm"),
+		filepath.Join(cfg.WasmaquaDir, "wasmaqua.wasm"),
+	}
+	for _, app := range refreshClients {
+		paths = append(paths, filepath.Join(cfg.WasmboxDir, "clients", app, app+".wasm"))
+	}
+	return paths
+}
+
+// removeFn is the file-removal seam; tests override it to record removals
+// without touching the real filesystem.
+var removeFn = os.Remove
+
+// PhaseRefreshClean wipes every wasm artifact PhaseBuild is responsible for
+// regenerating. Removal is best-effort: a missing file (the first-ever build)
+// is fine, but other errors are surfaced so the user sees genuine fs problems.
+//
+// Why this exists: wasmbox/Taskfile has `generates:` rules whose deps are
+// scoped to the wasmbox source tree. When a sibling repo (engine, ocode,
+// terminal) changes, the wasmbox build does not see those mtimes and skips the
+// rebuild -- so a cross-repo change like the engine input-fix 9546687 would
+// never reach the running stack. By removing the artifact first we force
+// Task's generates-vs-deps check to rebuild.
+func PhaseRefreshClean(ctx context.Context, cfg Config) error {
+	logf(cfg.Stdout, "[refresh] cleaning stale wasm artifacts (forces rebuild from sibling-repo sources)")
+	for _, p := range refreshArtifactPaths(cfg) {
+		if err := removeFn(p); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove %s: %w", p, err)
+		}
+		// ctx may be cancelled mid-loop; abort cleanly.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// PhaseRefreshRepack runs `task ociapps:pack:<app>` then `task ociapps:push:<app>`
+// inside wasmbox for every entry in refreshClients. Without this the OCI
+// registry keeps serving the previous wasm digests and the browser pulls
+// stale code even though disk has fresh bytes. The first error stops the
+// loop; runUp logs it as best-effort because a missing registry is recoverable
+// (the next `task up` will retry).
+func PhaseRefreshRepack(ctx context.Context, cfg Config, r Runner) error {
+	if !dirExists(cfg.WasmboxDir) {
+		logf(cfg.Stdout, "[refresh] wasmbox dir not found at %s, skipping OCI repack", cfg.WasmboxDir)
+		return nil
+	}
+	for _, app := range refreshClients {
+		logf(cfg.Stdout, "[refresh] re-pack + re-push OCI image: %s", app)
+		if err := r.Run(ctx, cfg.WasmboxDir, nil, "task", "ociapps:pack:"+app); err != nil {
+			return fmt.Errorf("ociapps:pack:%s: %w", app, err)
+		}
+		if err := r.Run(ctx, cfg.WasmboxDir, nil, "task", "ociapps:push:"+app); err != nil {
+			return fmt.Errorf("ociapps:push:%s: %w", app, err)
+		}
+	}
+	return nil
+}
+
+// runRefresh is the entry point for `task refresh`: do a full clean +
+// rebuild + repack + repush of the cross-repo wasm + OCI assets without
+// spawning the serve binaries. Useful for "I changed a sibling, push the new
+// bytes to my running stack". Registry/quake-push are reused from the up
+// path so behaviour matches `task up`.
+func runRefresh(ctx context.Context, cfg Config, r Runner) error {
+	logf(cfg.Stdout, "wasmdesk-up: refresh (clean + rebuild + repack + repush)")
+	if !cfg.SkipRegistry {
+		if err := PhaseRegistry(ctx, cfg, r); err != nil {
+			return fmt.Errorf("registry phase: %w", err)
+		}
+	}
+	if err := PhaseRefreshClean(ctx, cfg); err != nil {
+		return fmt.Errorf("refresh-clean phase: %w", err)
+	}
+	if !cfg.SkipBuild {
+		if err := PhaseBuild(ctx, cfg, r); err != nil {
+			return fmt.Errorf("build phase: %w", err)
+		}
+	}
+	if err := PhaseRefreshRepack(ctx, cfg, r); err != nil {
+		return fmt.Errorf("refresh-repack phase: %w", err)
+	}
+	if !cfg.SkipQuakePush {
+		if err := PhaseQuakePush(ctx, cfg, r); err != nil {
+			logf(cfg.Stderr, "quake push phase (best-effort): %v", err)
+		}
+	}
+	logf(cfg.Stdout, "wasmdesk-up: refresh done")
 	return nil
 }
 

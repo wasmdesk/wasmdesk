@@ -1,6 +1,11 @@
 # Taskfile for the wasmdesk meta-project -- https://taskfile.dev
 #
-#   task up        # build everything, push Quake assets if possible, start the 3 servers
+#   task up        # refresh + build + push Quake assets + start the 3 servers
+#                  # (the refresh phase wipes sibling wasms + repushes OCI
+#                  #  images so every `task up` picks up cross-repo changes)
+#   task up:fast   # `up` minus refresh -- iterate fast when you trust on-disk state
+#   task refresh   # standalone refresh: clean + rebuild + repack + repush, no spawn
+#                  # (use after a sibling commit lands while the stack is running)
 #   task down      # stop the 3 servers + the registry container
 #   task build     # build the orchestrator + delegate to sibling repos
 #   task status    # GET /healthz on each endpoint
@@ -34,10 +39,22 @@ tasks:
       - go build -trimpath -o bin/wasmdesk-up ./cmd/up
 
   up:
-    desc: Build everything + start the full wasmdesk stack
+    desc: Refresh + build + start the full wasmdesk stack (refresh wipes sibling wasms + repushes OCI so cross-repo source changes propagate every launch)
     deps: [build]
     cmds:
       - ./bin/wasmdesk-up
+
+  up:fast:
+    desc: Like `up` but skip the cross-repo wasm/OCI refresh -- iterate fast when you trust on-disk state
+    deps: [build]
+    cmds:
+      - SKIP_REFRESH=1 ./bin/wasmdesk-up
+
+  refresh:
+    desc: Standalone refresh -- wipe sibling wasms, rebuild from latest sources, repack + repush all OCI images, then exit (no spawn). Use while the stack is already running to push fresh bytes
+    deps: [build]
+    cmds:
+      - ./bin/wasmdesk-up -mode=refresh
 
   down:
     desc: Stop the wasmdesk stack -- SIGTERM the 3 servers + stop the OCI registry container

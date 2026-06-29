@@ -45,7 +45,7 @@ func TestLoadConfig_Defaults(t *testing.T) {
 	if cfg.EngineDir != "../../go-quake1/engine" || cfg.OciappsDir != "../ociapps" {
 		t.Fatalf("default ext dirs: %+v", cfg)
 	}
-	if cfg.SkipBuild || cfg.SkipRegistry || cfg.SkipQuakePush {
+	if cfg.SkipBuild || cfg.SkipRegistry || cfg.SkipQuakePush || cfg.SkipRefresh {
 		t.Fatalf("skip defaults: %+v", cfg)
 	}
 	if cfg.HealthTimeout != 10*time.Second || cfg.StopGrace != 3*time.Second {
@@ -63,6 +63,7 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 		"WASMBOX_PORT": "1000", "WASMAQUA_PORT": "1001",
 		"WASMLOGIN_PORT": "1002", "REGISTRY_PORT": "1003",
 		"SKIP_BUILD": "1", "SKIP_REGISTRY": "true", "SKIP_QUAKE_PUSH": "yes",
+		"SKIP_REFRESH":   "on",
 		"HEALTH_TIMEOUT": "5s", "STOP_GRACE": "1s",
 	}
 	cfg, err := LoadConfig(nil, mapGetenv(env), &bytes.Buffer{}, &bytes.Buffer{})
@@ -70,7 +71,8 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.WasmboxDir != "/a" || cfg.WasmboxPort != 1000 || !cfg.SkipBuild ||
-		!cfg.SkipRegistry || !cfg.SkipQuakePush || cfg.HealthTimeout != 5*time.Second {
+		!cfg.SkipRegistry || !cfg.SkipQuakePush || !cfg.SkipRefresh ||
+		cfg.HealthTimeout != 5*time.Second {
 		t.Fatalf("env overrides not applied: %+v", cfg)
 	}
 }
@@ -473,6 +475,10 @@ func baseCfg(t *testing.T, w io.Writer) Config {
 		Stdout:        w,
 		Stderr:        w,
 		Mode:          "up",
+		// Default refresh OFF for legacy tests; the dedicated refresh tests
+		// flip it back on. This keeps the call-counting tests
+		// (phasedRunner, etc.) stable across the refresh insertion.
+		SkipRefresh: true,
 	}
 }
 
@@ -1050,6 +1056,461 @@ func TestSyncWriter_Nil(t *testing.T) {
 	n, err := sw.Write([]byte("hello"))
 	if err != nil || n != 5 {
 		t.Fatalf("nil writer should swallow, got n=%d err=%v", n, err)
+	}
+}
+
+// ---- refresh phase ----
+
+func TestRefreshArtifactPaths_Shape(t *testing.T) {
+	cfg := Config{WasmboxDir: "/wbx", WasmaquaDir: "/waq"}
+	paths := refreshArtifactPaths(cfg)
+	// Compositors (2) + quake + 5 sibling clients = 8.
+	if len(paths) != 8 {
+		t.Fatalf("expected 8 artifacts, got %d: %v", len(paths), paths)
+	}
+	// Spot-check three load-bearing entries the user explicitly named in the
+	// design doc: quake (engine input-fix), code (460-px height fix), terminal.
+	var sawQuake, sawCode, sawTerminal bool
+	for _, p := range paths {
+		switch p {
+		case filepath.Join("/wbx", "clients", "quake", "quake.wasm"):
+			sawQuake = true
+		case filepath.Join("/wbx", "clients", "code", "code.wasm"):
+			sawCode = true
+		case filepath.Join("/wbx", "clients", "terminal", "terminal.wasm"):
+			sawTerminal = true
+		}
+	}
+	if !sawQuake || !sawCode || !sawTerminal {
+		t.Fatalf("missing one of quake/code/terminal: %v", paths)
+	}
+}
+
+func TestPhaseRefreshClean_HappyPathRemovesAll(t *testing.T) {
+	td := t.TempDir()
+	cfg := Config{
+		WasmboxDir:  filepath.Join(td, "wbx"),
+		WasmaquaDir: filepath.Join(td, "waq"),
+		Stdout:      &safeBuf{},
+		Stderr:      &safeBuf{},
+	}
+	// Create every artifact + a sentinel file to confirm we don't over-remove.
+	for _, p := range refreshArtifactPaths(cfg) {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("stale"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sentinel := filepath.Join(cfg.WasmboxDir, "compositor.rb")
+	if err := os.WriteFile(sentinel, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := PhaseRefreshClean(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range refreshArtifactPaths(cfg) {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("expected %s removed, got err=%v", p, err)
+		}
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("sentinel must survive: %v", err)
+	}
+}
+
+func TestPhaseRefreshClean_MissingIsFine(t *testing.T) {
+	// First-ever build: no wasm artifacts exist yet -> clean is a no-op.
+	td := t.TempDir()
+	cfg := Config{
+		WasmboxDir:  filepath.Join(td, "wbx"),
+		WasmaquaDir: filepath.Join(td, "waq"),
+		Stdout:      &safeBuf{},
+		Stderr:      &safeBuf{},
+	}
+	if err := PhaseRefreshClean(context.Background(), cfg); err != nil {
+		t.Fatalf("missing files should be ignored: %v", err)
+	}
+}
+
+func TestPhaseRefreshClean_RemoveFailSurfacesError(t *testing.T) {
+	save := removeFn
+	defer func() { removeFn = save }()
+	removeFn = func(string) error { return errors.New("permission denied") }
+	cfg := Config{WasmboxDir: "/x", WasmaquaDir: "/y", Stdout: &safeBuf{}}
+	if err := PhaseRefreshClean(context.Background(), cfg); err == nil {
+		t.Fatal("expected remove err to surface")
+	}
+}
+
+func TestPhaseRefreshClean_ContextCancelled(t *testing.T) {
+	save := removeFn
+	defer func() { removeFn = save }()
+	// Removal succeeds; context is already cancelled so we hit the ctx-check.
+	removeFn = func(string) error { return nil }
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cfg := Config{WasmboxDir: "/x", WasmaquaDir: "/y", Stdout: &safeBuf{}}
+	if err := PhaseRefreshClean(ctx, cfg); err == nil {
+		t.Fatal("expected ctx err")
+	}
+}
+
+func TestPhaseRefreshRepack_HappyPath(t *testing.T) {
+	var out safeBuf
+	cfg := baseCfg(t, &out)
+	r := newFakeRunner()
+	if err := PhaseRefreshRepack(context.Background(), cfg, r); err != nil {
+		t.Fatal(err)
+	}
+	// 5 clients * (pack + push) = 10 task calls.
+	if len(r.calls) != 10 {
+		t.Fatalf("expected 10 task calls, got %d: %v", len(r.calls), r.calls)
+	}
+}
+
+func TestPhaseRefreshRepack_MissingWasmboxSkips(t *testing.T) {
+	var out safeBuf
+	cfg := baseCfg(t, &out)
+	cfg.WasmboxDir = "/no/such/wasmbox"
+	r := newFakeRunner()
+	if err := PhaseRefreshRepack(context.Background(), cfg, r); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.calls) != 0 {
+		t.Fatal("missing wasmbox -> no calls")
+	}
+	if !strings.Contains(out.String(), "wasmbox dir not found") {
+		t.Fatalf("expected skip msg, got %q", out.String())
+	}
+}
+
+func TestPhaseRefreshRepack_PackFails(t *testing.T) {
+	var out safeBuf
+	cfg := baseCfg(t, &out)
+	r := newFakeRunner()
+	r.runErr["task"] = errors.New("pack boom")
+	if err := PhaseRefreshRepack(context.Background(), cfg, r); err == nil {
+		t.Fatal("expected pack err")
+	}
+}
+
+func TestPhaseRefreshRepack_PushFails(t *testing.T) {
+	// Pack succeeds, push fails -- use a counting runner.
+	var out safeBuf
+	cfg := baseCfg(t, &out)
+	// First call is pack:terminal (success), second is push:terminal (fail).
+	rc := &countingRunner{fail: 2}
+	if err := PhaseRefreshRepack(context.Background(), cfg, rc); err == nil {
+		t.Fatal("expected push err")
+	}
+}
+
+// ---- Run() with refresh wired in ----
+
+func TestRun_UpWithRefresh_OrderingAndFlush(t *testing.T) {
+	// Drive runUp through the refresh-enabled path. We assert that the clean
+	// stage logs "[refresh] cleaning" BEFORE the build phase's "[build]"
+	// line, and the repack stage's "[refresh] re-pack" lines appear AFTER
+	// the build phase. This is the contract the user cares about: rebuild
+	// from fresh sources, then push fresh OCI bytes.
+	mk := func() (*httptest.Server, int) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) }))
+		return srv, portOf(srv.URL)
+	}
+	sReg, pReg := mk()
+	sBox, pBox := mk()
+	sAqua, pAqua := mk()
+	sLogin, pLogin := mk()
+	defer sReg.Close()
+	defer sBox.Close()
+	defer sAqua.Close()
+	defer sLogin.Close()
+	var out safeBuf
+	cfg := baseCfg(t, &out)
+	cfg.SkipRefresh = false // turn refresh BACK ON for this test
+	cfg.RegistryPort, cfg.WasmboxPort, cfg.WasmaquaPort, cfg.WasmloginPort = pReg, pBox, pAqua, pLogin
+	cfg.HealthTimeout = 500 * time.Millisecond
+	cfg.StopGrace = 50 * time.Millisecond
+	r := newFakeRunner()
+	sigCh := make(chan os.Signal, 1)
+	go func() {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if strings.Contains(out.String(), "wasmdesk stack up") {
+				sigCh <- syscall.SIGTERM
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		sigCh <- syscall.SIGTERM
+	}()
+	if err := Run(context.Background(), cfg, r, sigCh); err != nil {
+		t.Fatalf("Run err: %v -- out: %s", err, out.String())
+	}
+	s := out.String()
+	cleanIdx := strings.Index(s, "[refresh] cleaning")
+	buildIdx := strings.Index(s, "[build] wasmbox")
+	repackIdx := strings.Index(s, "[refresh] re-pack + re-push OCI image: terminal")
+	if cleanIdx < 0 || buildIdx < 0 || repackIdx < 0 {
+		t.Fatalf("missing one of clean/build/repack markers in: %s", s)
+	}
+	if !(cleanIdx < buildIdx && buildIdx < repackIdx) {
+		t.Fatalf("expected clean < build < repack, got clean=%d build=%d repack=%d",
+			cleanIdx, buildIdx, repackIdx)
+	}
+}
+
+func TestRun_UpSkipRefreshShortCircuits(t *testing.T) {
+	// SkipRefresh=true -> the "[skip] refresh" line shows and neither
+	// "[refresh] cleaning" nor any "[refresh] re-pack" lines appear.
+	mk := func() (*httptest.Server, int) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) }))
+		return srv, portOf(srv.URL)
+	}
+	sReg, pReg := mk()
+	sBox, pBox := mk()
+	sAqua, pAqua := mk()
+	sLogin, pLogin := mk()
+	defer sReg.Close()
+	defer sBox.Close()
+	defer sAqua.Close()
+	defer sLogin.Close()
+	var out safeBuf
+	cfg := baseCfg(t, &out)
+	cfg.SkipRefresh = true
+	cfg.RegistryPort, cfg.WasmboxPort, cfg.WasmaquaPort, cfg.WasmloginPort = pReg, pBox, pAqua, pLogin
+	cfg.HealthTimeout = 500 * time.Millisecond
+	cfg.StopGrace = 50 * time.Millisecond
+	r := newFakeRunner()
+	sigCh := make(chan os.Signal, 1)
+	go func() {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if strings.Contains(out.String(), "wasmdesk stack up") {
+				sigCh <- syscall.SIGTERM
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		sigCh <- syscall.SIGTERM
+	}()
+	if err := Run(context.Background(), cfg, r, sigCh); err != nil {
+		t.Fatalf("Run err: %v -- out: %s", err, out.String())
+	}
+	s := out.String()
+	if !strings.Contains(s, "[skip] refresh phase") {
+		t.Fatalf("missing skip line: %s", s)
+	}
+	if strings.Contains(s, "[refresh] cleaning") || strings.Contains(s, "[refresh] re-pack") {
+		t.Fatalf("refresh should have been skipped: %s", s)
+	}
+}
+
+func TestRun_UpRefreshCleanFails(t *testing.T) {
+	// Force PhaseRefreshClean to return an error via the removeFn seam, then
+	// drive runUp with refresh ON and assert the error propagates.
+	save := removeFn
+	defer func() { removeFn = save }()
+	removeFn = func(string) error { return errors.New("disk full") }
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) }))
+	defer srv.Close()
+	var out safeBuf
+	cfg := baseCfg(t, &out)
+	cfg.SkipRefresh = false
+	cfg.RegistryPort = portOf(srv.URL)
+	sigCh := make(chan os.Signal, 1)
+	if err := Run(context.Background(), cfg, newFakeRunner(), sigCh); err == nil {
+		t.Fatal("expected refresh-clean err")
+	}
+}
+
+func TestRun_UpRefreshRepackBestEffort(t *testing.T) {
+	// PhaseRefreshRepack failing is logged but does NOT halt the up flow.
+	// We pair it with a healthy stack so Run() continues all the way to the
+	// banner -> shutdown.
+	mk := func() (*httptest.Server, int) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) }))
+		return srv, portOf(srv.URL)
+	}
+	sReg, pReg := mk()
+	sBox, pBox := mk()
+	sAqua, pAqua := mk()
+	sLogin, pLogin := mk()
+	defer sReg.Close()
+	defer sBox.Close()
+	defer sAqua.Close()
+	defer sLogin.Close()
+	var out safeBuf
+	cfg := baseCfg(t, &out)
+	cfg.SkipRefresh = false
+	cfg.RegistryPort, cfg.WasmboxPort, cfg.WasmaquaPort, cfg.WasmloginPort = pReg, pBox, pAqua, pLogin
+	cfg.HealthTimeout = 500 * time.Millisecond
+	cfg.StopGrace = 50 * time.Millisecond
+	// First 3 task calls are build (succeed); 4th = refresh-repack pack:terminal -> fail.
+	r := &phasedRunner{quakeFail: true}
+	sigCh := make(chan os.Signal, 1)
+	go func() {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if strings.Contains(out.String(), "wasmdesk stack up") {
+				sigCh <- syscall.SIGTERM
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		sigCh <- syscall.SIGTERM
+	}()
+	if err := Run(context.Background(), cfg, r, sigCh); err != nil {
+		t.Fatalf("Run err: %v -- out: %s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "refresh-repack phase (best-effort)") {
+		t.Fatalf("expected best-effort warning, got %s", out.String())
+	}
+}
+
+// ---- mode=refresh standalone ----
+
+func TestRun_RefreshMode_HappyPath(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) }))
+	defer srv.Close()
+	var out safeBuf
+	cfg := baseCfg(t, &out)
+	cfg.Mode = "refresh"
+	cfg.SkipRefresh = false
+	cfg.RegistryPort = portOf(srv.URL)
+	r := newFakeRunner()
+	if err := Run(context.Background(), cfg, r, nil); err != nil {
+		t.Fatalf("refresh err: %v -- out: %s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "refresh done") {
+		t.Fatalf("missing done line: %s", out.String())
+	}
+	// task calls: 3 build + 10 repack = 13 (quake skipped, no pak0).
+	taskCalls := 0
+	for _, c := range r.calls {
+		if strings.Contains(c, "RUN ") && strings.Contains(c, " task ") {
+			taskCalls++
+		}
+	}
+	if taskCalls != 13 {
+		t.Fatalf("expected 13 task calls (3 build + 10 repack), got %d: %v", taskCalls, r.calls)
+	}
+}
+
+func TestRun_RefreshMode_RegistryFails(t *testing.T) {
+	var out safeBuf
+	cfg := baseCfg(t, &out)
+	cfg.Mode = "refresh"
+	cfg.SkipRefresh = false
+	cfg.RegistryPort = 65510
+	r := newFakeRunner()
+	r.runErr["docker"] = errors.New("no docker")
+	if err := Run(context.Background(), cfg, r, nil); err == nil {
+		t.Fatal("expected registry err")
+	}
+}
+
+func TestRun_RefreshMode_SkipRegistry(t *testing.T) {
+	// SkipRegistry short-circuits the registry phase even in refresh mode.
+	var out safeBuf
+	cfg := baseCfg(t, &out)
+	cfg.Mode = "refresh"
+	cfg.SkipRefresh = false
+	cfg.SkipRegistry = true
+	r := newFakeRunner()
+	if err := Run(context.Background(), cfg, r, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRun_RefreshMode_CleanFails(t *testing.T) {
+	save := removeFn
+	defer func() { removeFn = save }()
+	removeFn = func(string) error { return errors.New("ro fs") }
+	var out safeBuf
+	cfg := baseCfg(t, &out)
+	cfg.Mode = "refresh"
+	cfg.SkipRefresh = false
+	cfg.SkipRegistry = true
+	if err := Run(context.Background(), cfg, newFakeRunner(), nil); err == nil {
+		t.Fatal("expected clean err")
+	}
+}
+
+func TestRun_RefreshMode_BuildFails(t *testing.T) {
+	var out safeBuf
+	cfg := baseCfg(t, &out)
+	cfg.Mode = "refresh"
+	cfg.SkipRefresh = false
+	cfg.SkipRegistry = true
+	r := newFakeRunner()
+	r.runErr["task"] = errors.New("build no")
+	if err := Run(context.Background(), cfg, r, nil); err == nil {
+		t.Fatal("expected build err")
+	}
+}
+
+func TestRun_RefreshMode_SkipBuild(t *testing.T) {
+	// SkipBuild + SkipRegistry -> goes straight from clean to repack.
+	var out safeBuf
+	cfg := baseCfg(t, &out)
+	cfg.Mode = "refresh"
+	cfg.SkipRefresh = false
+	cfg.SkipRegistry = true
+	cfg.SkipBuild = true
+	r := newFakeRunner()
+	if err := Run(context.Background(), cfg, r, nil); err != nil {
+		t.Fatal(err)
+	}
+	// 10 task calls (pack+push for 5 apps), no builds.
+	if len(r.calls) != 10 {
+		t.Fatalf("expected 10 calls (only repack), got %d: %v", len(r.calls), r.calls)
+	}
+}
+
+func TestRun_RefreshMode_RepackFailsHard(t *testing.T) {
+	// Unlike `runUp` (best-effort), `runRefresh` returns the repack error so
+	// the user knows their refresh did not actually refresh.
+	var out safeBuf
+	cfg := baseCfg(t, &out)
+	cfg.Mode = "refresh"
+	cfg.SkipRefresh = false
+	cfg.SkipRegistry = true
+	cfg.SkipBuild = true
+	r := newFakeRunner()
+	r.runErr["task"] = errors.New("push no")
+	if err := Run(context.Background(), cfg, r, nil); err == nil {
+		t.Fatal("expected repack err to be hard in refresh mode")
+	}
+}
+
+func TestRun_RefreshMode_QuakePushBestEffort(t *testing.T) {
+	// In refresh mode, quake-push failure is also best-effort: with pak0
+	// present + a runner that fails the engine's `task oci-pack`, the call
+	// is logged but Run() still returns nil.
+	var out safeBuf
+	cfg := baseCfg(t, &out)
+	cfg.Mode = "refresh"
+	cfg.SkipRefresh = false
+	cfg.SkipRegistry = true
+	cfg.SkipBuild = true
+	// Create pak0 so PhaseQuakePush actually invokes the runner.
+	pak := filepath.Join(cfg.EngineDir, "id1", "pak0.pak")
+	if err := os.MkdirAll(filepath.Dir(pak), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pak, []byte("fake"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// First 10 task calls (repack) succeed; quake-pack would be call 11 -> fail.
+	rc := &countingRunner{fail: 11}
+	if err := Run(context.Background(), cfg, rc, nil); err != nil {
+		t.Fatalf("quake-push should be best-effort in refresh: %v", err)
+	}
+	if !strings.Contains(out.String(), "quake push phase (best-effort)") {
+		t.Fatalf("expected best-effort quake msg: %s", out.String())
 	}
 }
 
