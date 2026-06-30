@@ -525,8 +525,12 @@ func TestPhaseBuild(t *testing.T) {
 	if err := PhaseBuild(context.Background(), cfg, r); err != nil {
 		t.Fatal(err)
 	}
-	if len(r.calls) != 3 {
-		t.Fatalf("expected 3 calls, got %d: %v", len(r.calls), r.calls)
+	// 2 calls = wasmbox + wasmlogin. wasmaqua dropped — PhaseSpawn now
+	// reuses the wasmbox-serve binary on the wasmaqua port with
+	// -default-frame=aqua, so the wasmaqua repo's build is no longer in
+	// the orchestrator's hot path.
+	if len(r.calls) != 2 {
+		t.Fatalf("expected 2 calls, got %d: %v", len(r.calls), r.calls)
 	}
 	// Missing dir -> err
 	cfg.WasmboxDir = "/no/such/dir"
@@ -1064,9 +1068,12 @@ func TestSyncWriter_Nil(t *testing.T) {
 func TestRefreshArtifactPaths_Shape(t *testing.T) {
 	cfg := Config{WasmboxDir: "/wbx", WasmaquaDir: "/waq"}
 	paths := refreshArtifactPaths(cfg)
-	// Compositors (2) + quake + 5 sibling clients = 8.
-	if len(paths) != 8 {
-		t.Fatalf("expected 8 artifacts, got %d: %v", len(paths), paths)
+	// wasmbox compositor + quake + 5 sibling clients = 7. (wasmaqua.wasm
+	// is no longer in the set — PhaseSpawn runs the wasmaqua port off the
+	// wasmbox-serve binary + -default-frame=aqua, so the wasmaqua wasm
+	// artifact is unused at runtime.)
+	if len(paths) != 7 {
+		t.Fatalf("expected 7 artifacts, got %d: %v", len(paths), paths)
 	}
 	// Spot-check three load-bearing entries the user explicitly named in the
 	// design doc: quake (engine input-fix), code (460-px height fix), terminal.
@@ -1387,15 +1394,16 @@ func TestRun_RefreshMode_HappyPath(t *testing.T) {
 	if !strings.Contains(out.String(), "refresh done") {
 		t.Fatalf("missing done line: %s", out.String())
 	}
-	// task calls: 3 build + 10 repack = 13 (quake skipped, no pak0).
+	// task calls: 2 build (wasmbox + wasmlogin; wasmaqua dropped — see
+	// PhaseBuild) + 10 repack = 12 (quake skipped, no pak0).
 	taskCalls := 0
 	for _, c := range r.calls {
 		if strings.Contains(c, "RUN ") && strings.Contains(c, " task ") {
 			taskCalls++
 		}
 	}
-	if taskCalls != 13 {
-		t.Fatalf("expected 13 task calls (3 build + 10 repack), got %d: %v", taskCalls, r.calls)
+	if taskCalls != 12 {
+		t.Fatalf("expected 12 task calls (2 build + 10 repack), got %d: %v", taskCalls, r.calls)
 	}
 }
 

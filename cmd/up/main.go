@@ -15,7 +15,8 @@
 //     when iterating fast and you trust the on-disk state.
 //  3. build     -- delegate to each sibling repo's own `task build` target.
 //  4. quake     -- best-effort `task -d $ENGINE_DIR oci-pack && oci-push`.
-//  5. spawn     -- launch wasmbox-serve / wasmaqua-serve / wasmlogin and tail
+//  5. spawn     -- launch two wasmbox-serve instances (one default-Openbox on
+//                  WasmboxPort, one default-aqua on WasmaquaPort) + wasmlogin, and tail
 //     their stdout/stderr with coloured "[name] " prefixes.
 //  6. health    -- poll /healthz (or /) on each endpoint every 200 ms until all
 //     respond 200 or 10 s elapses; print the "stack up" banner on success.
@@ -237,6 +238,11 @@ func runDown(ctx context.Context, cfg Config, r Runner) error {
 	logf(cfg.Stdout, "wasmdesk-up: stopping")
 	// pkill is best-effort; ignore its exit code so a clean tree (no
 	// matching processes) is not a failure.
+	// Both wasmbox + the wasmaqua-port instance run the wasmbox-serve
+	// binary (the second one with -default-frame=aqua); a single
+	// pkill on "wasmbox-serve" reaps both. Kept wasmaqua-serve in the
+	// list so legacy users who still build wasmaqua/bin/wasmaqua-serve
+	// + start it manually also get SIGTERM'd on `task down`.
 	for _, name := range []string{"wasmbox-serve", "wasmaqua-serve", "wasmlogin"} {
 		_ = r.Run(ctx, ".", nil, "pkill", "-TERM", "-f", name)
 	}
@@ -308,9 +314,14 @@ func PhaseBuild(ctx context.Context, cfg Config, r Runner) error {
 	type job struct {
 		name, dir, target string
 	}
+	// wasmaqua build dropped: PhaseSpawn now runs a second wasmbox-serve
+	// with -default-frame=aqua instead of wasmaqua-serve, so the sibling
+	// wasmaqua repo's build is no longer in the orchestrator's hot path.
+	// Legacy users who want to build wasmaqua independently still run
+	// `task build` inside the wasmaqua repo itself; this saves a redundant
+	// rebuild on every wasmdesk-up.
 	jobs := []job{
 		{"wasmbox", cfg.WasmboxDir, "build:all"},
-		{"wasmaqua", cfg.WasmaquaDir, "build"},
 		{"wasmlogin", cfg.WasmloginDir, "build"},
 	}
 	for _, j := range jobs {
@@ -340,12 +351,15 @@ var refreshClients = []string{"terminal", "files", "hello", "dock", "code"}
 //   wasmbox/clients/{app}/{app}.wasm      -> wasmbox    `task build:{app}`
 //   wasmbox/wasmbox.wasm                  -> wasmbox    `task build:compositor`
 //   wasmbox/clients/quake/quake.wasm      -> wasmbox    `task build:quake`
-//   wasmaqua/wasmaqua.wasm                -> wasmaqua   `task build:compositor`
+// wasmaqua/wasmaqua.wasm is no longer in the refresh set — PhaseSpawn
+// serves the wasmaqua port (8081) with a second wasmbox-serve instance
+// + -default-frame=aqua, so the wasmaqua wasm artifact is unused at
+// runtime. The legacy wasmaqua repo still builds independently for
+// users who go there directly.
 func refreshArtifactPaths(cfg Config) []string {
 	paths := []string{
 		filepath.Join(cfg.WasmboxDir, "wasmbox.wasm"),
 		filepath.Join(cfg.WasmboxDir, "clients", "quake", "quake.wasm"),
-		filepath.Join(cfg.WasmaquaDir, "wasmaqua.wasm"),
 	}
 	for _, app := range refreshClients {
 		paths = append(paths, filepath.Join(cfg.WasmboxDir, "clients", app, app+".wasm"))
@@ -478,9 +492,19 @@ func PhaseSpawn(ctx context.Context, cfg Config, r Runner) (*Supervisor, error) 
 			color: "\033[36m", // cyan
 		},
 		{
-			name: "wasmaqua", dir: cfg.WasmaquaDir,
-			bin:   filepath.Join(cfg.WasmaquaDir, "bin", "wasmaqua-serve"),
-			args:  []string{"-addr", fmt.Sprintf(":%d", cfg.WasmaquaPort)},
+			// "wasmaqua" port (8081 by default) now runs a SECOND wasmbox-serve
+			// instance with -default-frame=aqua so bare "/" redirects to
+			// "/?frame=aqua". Same binary, same compositor, same client matrix
+			// as the port-8080 instance; the only difference is the default
+			// landing-page Frame preset. This is the runtime side of the
+			// wasmaqua → wasmbox AquaFrame migration documented in
+			// wasmaqua/README.md (2026-06-30).
+			name: "wasmaqua", dir: cfg.WasmboxDir,
+			bin: filepath.Join(cfg.WasmboxDir, "bin", "wasmbox-serve"),
+			args: []string{
+				"-addr", fmt.Sprintf(":%d", cfg.WasmaquaPort),
+				"-default-frame=aqua",
+			},
 			color: "\033[35m", // magenta
 		},
 		{
