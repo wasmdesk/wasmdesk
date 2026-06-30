@@ -1,2 +1,6 @@
 /bin/
 /coverage.out
+# Stray binaries from `go build ./cmd/up` or `go test ./cmd/up` from
+# the repo root (Taskfile builds to bin/wasmdesk-up; this catches
+# accidental top-level builds named after the package).
+/up
