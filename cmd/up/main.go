@@ -16,7 +16,7 @@
 //  3. build     -- delegate to each sibling repo's own `task build` target.
 //  4. quake     -- best-effort `task -d $ENGINE_DIR oci-pack && oci-push`.
 //  5. spawn     -- launch two wasmbox-serve instances (one default-Openbox on
-//                  WasmboxPort, one default-aqua on WasmaquaPort) + wasmlogin, and tail
+//     WasmboxPort, one default-aqua on WasmaquaPort) + wasmlogin, and tail
 //     their stdout/stderr with coloured "[name] " prefixes.
 //  6. health    -- poll /healthz (or /) on each endpoint every 200 ms until all
 //     respond 200 or 10 s elapses; print the "stack up" banner on success.
@@ -348,9 +348,11 @@ var refreshClients = []string{"terminal", "files", "hello", "dock", "code"}
 // sibling repos grow new clients.
 //
 // For each entry the corresponding source repo + Taskfile target is:
-//   wasmbox/clients/{app}/{app}.wasm      -> wasmbox    `task build:{app}`
-//   wasmbox/wasmbox.wasm                  -> wasmbox    `task build:compositor`
-//   wasmbox/clients/quake/quake.wasm      -> wasmbox    `task build:quake`
+//
+//	wasmbox/clients/{app}/{app}.wasm      -> wasmbox    `task build:{app}`
+//	wasmbox/wasmbox.wasm                  -> wasmbox    `task build:compositor`
+//	wasmbox/clients/quake/quake.wasm      -> wasmbox    `task build:quake`
+//
 // wasmaqua/wasmaqua.wasm is no longer in the refresh set — PhaseSpawn
 // serves the wasmaqua port (8081) with a second wasmbox-serve instance
 // + -default-frame=aqua, so the wasmaqua wasm artifact is unused at
