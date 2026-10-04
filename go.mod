@@ -1,3 +1,3 @@
 module github.com/wasmdesk/wasmdesk
 
-go 1.26.4
+go 1.27.1
